@@ -8,6 +8,7 @@ from uuid import uuid4
 from eth_account import Account
 from eth_account.typed_transactions import TypedTransaction
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import requests
 import rlp
 from web3 import Web3
@@ -108,7 +109,7 @@ class Blockchain:
         Membuat transaksi baru yang akan masuk ke blok berikutnya yang di-mine (FR-2).
         Dilindungi oleh self.lock untuk thread-safety.
         Mencegah double-spending dan transaksi defisit saldo:
-        - Abaikan validasi saldo jika sender == '0' (reward coinbase).
+        - Abaikan validasi saldo jika sender == '0' (reward coinbase / minting).
         - Hitung total amount yang sudah dikomit oleh sender di self.current_transactions (pending_spent).
         - Jika get_balance(sender) - pending_spent < amount, tolak dengan ValueError('Saldo tidak mencukupi').
         """
@@ -227,10 +228,10 @@ class Blockchain:
                 norm_recipient = self._normalize_address(recipient)
 
                 if sender == "0":
-                    # Transaksi coinbase reward: tambah saldo recipient
+                    # Transaksi coinbase reward / minting
                     balances[norm_recipient] = balances.get(norm_recipient, 0.0) + amount
                 else:
-                    # Transaksi reguler: cek apakah saldo kumulatif sender mencukupi
+                    # Transaksi reguler
                     sender_bal = balances.get(norm_sender, 0.0)
                     if sender_bal < amount:
                         return False
@@ -325,11 +326,46 @@ class Blockchain:
 # Inisialisasi Flask Node
 app = Flask(__name__)
 
+# Mengaktifkan CORS untuk seluruh route agar MetaMask & browser web dapat mengakses API
+CORS(app)
+
 # ID Unik untuk node ini (sebagai penerima reward mining)
 node_identifier = str(uuid4()).replace('-', '')
 
 # Inisialisasi Blockchain
 blockchain = Blockchain()
+
+
+# ------------------------------------------------------------------------------
+# Helper Mining Blok Baru
+# ------------------------------------------------------------------------------
+def mine_block(reward_recipient=node_identifier, reward_amount=1):
+    """
+    Menjalankan proses mining untuk membungkus transaksi antrean:
+    1. Masukkan transaksi reward coinbase.
+    2. Susun candidate_block.
+    3. Jalankan proof_of_work.
+    4. Simpan ke chain via append_block.
+    """
+    blockchain.new_transaction(
+        sender="0",
+        recipient=reward_recipient,
+        amount=reward_amount,
+    )
+
+    with blockchain.lock:
+        last_block = blockchain.chain[-1]
+        candidate_block = {
+            'index': len(blockchain.chain) + 1,
+            'timestamp': time(),
+            'transactions': list(blockchain.current_transactions),
+            'proof': 0,
+            'previous_hash': blockchain.hash(last_block)
+        }
+
+    blockchain.proof_of_work(candidate_block)
+    block = blockchain.append_block(candidate_block)
+    return block
 
 
 # ------------------------------------------------------------------------------
@@ -362,16 +398,20 @@ def parse_raw_transaction(raw_bytes):
 
 
 # ------------------------------------------------------------------------------
-# Ethereum JSON-RPC 2.0 Bridge Handler (POST /)
+# Ethereum JSON-RPC 2.0 Bridge Handler (POST & OPTIONS /)
 # ------------------------------------------------------------------------------
-@app.route('/', methods=['POST'])
+@app.route('/', methods=['POST', 'OPTIONS'])
 def json_rpc():
     """
     Lapisan JSON-RPC 2.0 Bridge untuk MetaMask:
-    Mendukung eth_chainId, net_version, eth_blockNumber, eth_getBalance,
-    eth_getTransactionCount, eth_estimateGas, eth_gasPrice, eth_sendRawTransaction,
-    eth_getBlockByNumber, eth_getTransactionReceipt, dsb.
+    Mendukung CORS preflight (OPTIONS), eth_chainId, net_version, eth_blockNumber,
+    eth_getBalance, eth_getTransactionCount, eth_estimateGas, eth_gasPrice,
+    eth_sendRawTransaction, eth_getBlockByNumber, eth_getTransactionReceipt,
+    serta fallback RPC handler default ("0x0").
     """
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({
@@ -420,7 +460,7 @@ def json_rpc():
                 # Standar 21000 gas -> 0x5208
                 return {"jsonrpc": "2.0", "id": req_id, "result": "0x5208"}
 
-            elif method == 'eth_gasPrice':
+            elif method in ('eth_gasPrice', 'eth_maxPriorityFeePerGas'):
                 return {"jsonrpc": "2.0", "id": req_id, "result": "0x0"}
 
             elif method == 'eth_sendRawTransaction':
@@ -451,6 +491,9 @@ def json_rpc():
 
                 # 5. Masukkan ke mempool via new_transaction
                 blockchain.new_transaction(sender, to_addr, value_coins, tx_hash=tx_hash)
+
+                # 6. Auto-mining untuk interaksi UI: langsung picu penambangan blok baru
+                mine_block()
 
                 return {"jsonrpc": "2.0", "id": req_id, "result": tx_hash}
 
@@ -528,7 +571,6 @@ def json_rpc():
 
             elif method == 'eth_getTransactionReceipt':
                 tx_hash = params[0] if params else None
-                # Cari blok yang memuat transaksi ini
                 found_block = None
                 tx_index = 0
                 with blockchain.lock:
@@ -566,9 +608,6 @@ def json_rpc():
             elif method == 'web3_clientVersion':
                 return {"jsonrpc": "2.0", "id": req_id, "result": "SMPL-Blockchain/v1.0"}
 
-            elif method in ('eth_call', 'eth_getCode'):
-                return {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
-
             elif method == 'eth_feeHistory':
                 return {
                     "jsonrpc": "2.0",
@@ -581,12 +620,16 @@ def json_rpc():
                     }
                 }
 
+            elif method == 'eth_accounts':
+                return {"jsonrpc": "2.0", "id": req_id, "result": []}
+
+            elif method in ('eth_call', 'eth_getCode'):
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
+
             else:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32601, "message": f"Method '{method}' not implemented"}
-                }
+                # Default fallback: jika ada method yang belum dikenali,
+                # kembalikan "0x0" bukan HTTP 500
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x0"}
 
         except Exception as e:
             return {
@@ -599,6 +642,38 @@ def json_rpc():
         return jsonify([handle_request(item) for item in data]), 200
     else:
         return jsonify(handle_request(data)), 200
+
+
+# ------------------------------------------------------------------------------
+# Faucet Endpoint Sederhana
+# ------------------------------------------------------------------------------
+@app.route('/faucet/<address>', methods=['GET'])
+def faucet(address):
+    """
+    Mencetak dan mengirim 10 koin SMPL ke alamat heksadesimal yang diminta,
+    langsung menambang bloknya, dan mengembalikan HTTP 200.
+    """
+    if not address or not isinstance(address, str):
+        return jsonify({'message': 'Invalid address'}), 400
+
+    # Masukkan transaksi minting 10 koin dari sistem ('0')
+    blockchain.new_transaction(
+        sender="0",
+        recipient=address,
+        amount=10
+    )
+
+    # Langsung picu penambangan blok baru
+    block = mine_block()
+
+    return jsonify({
+        'status': 'success',
+        'message': f'10 SMPL successfully minted to {address}',
+        'address': address,
+        'amount': 10,
+        'block_index': block['index'],
+        'balance': blockchain.get_balance(address)
+    }), 200
 
 
 # ------------------------------------------------------------------------------
@@ -665,37 +740,8 @@ def new_transaction():
 
 @app.route('/mine', methods=['GET'])
 def mine():
-    """
-    Menjalankan proses mining:
-    1. Masukkan transaksi reward coinbase ke current_transactions terlebih dahulu.
-    2. Susun objek candidate_block.
-    3. Jalankan proof_of_work(candidate_block) yang memutasi field 'proof' in-place.
-    4. Simpan ke chain via append_block.
-    """
-    # 1. Transaksi reward mining (FR-4)
-    blockchain.new_transaction(
-        sender="0",
-        recipient=node_identifier,
-        amount=1,
-    )
-
-    # 2. Susun objek candidate_block di bawah lock
-    with blockchain.lock:
-        last_block = blockchain.chain[-1]
-        candidate_block = {
-            'index': len(blockchain.chain) + 1,
-            'timestamp': time(),
-            'transactions': list(blockchain.current_transactions),
-            'proof': 0,
-            'previous_hash': blockchain.hash(last_block)
-        }
-
-    # 3. Jalankan Proof of Work (komputasi CPU intensif dilakukan di luar lock)
-    blockchain.proof_of_work(candidate_block)
-
-    # 4. Simpan ke chain dan reset mempool
-    block = blockchain.append_block(candidate_block)
-
+    """Menjalankan proses mining via endpoint REST."""
+    block = mine_block()
     response = {
         'message': 'New Block Forged',
         'index': block['index'],

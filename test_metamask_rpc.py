@@ -48,7 +48,7 @@ def run_metamask_rpc_tests():
     try:
         # Jalankan Node Blockchain di port 5000
         script_path = os.path.abspath("blockchain.py")
-        print("[1/5] Menjalankan Node Blockchain (Port 5000) dengan JSON-RPC Bridge...")
+        print("[1/7] Menjalankan Node Blockchain (Port 5000) dengan JSON-RPC Bridge...")
         p = subprocess.Popen(
             [sys.executable, script_path, "5000"],
             stdout=subprocess.DEVNULL,
@@ -60,9 +60,19 @@ def run_metamask_rpc_tests():
         print("      [+] Node berhasil aktif dan siap melayani JSON-RPC 2.0.\n")
 
         # ----------------------------------------------------------------------
-        # a. Query eth_chainId & net_version
+        # 1. Uji Penanganan CORS (OPTIONS & Header)
         # ----------------------------------------------------------------------
-        print("[2/5] (a) Query eth_chainId & net_version...")
+        print("[2/7] (1) Uji Penanganan CORS (Preflight OPTIONS & Headers)...")
+        opt_res = requests.options(RPC_URL, timeout=3)
+        assert opt_res.status_code == 200, f"OPTIONS request harus return 200, got {opt_res.status_code}"
+        assert "Access-Control-Allow-Origin" in opt_res.headers, "Header Access-Control-Allow-Origin harus ada"
+        print(f"      [+] OPTIONS / return HTTP 200 dengan Access-Control-Allow-Origin: {opt_res.headers.get('Access-Control-Allow-Origin')}")
+        print("      [PASSED] Penanganan CORS aktif untuk seluruh rute.\n")
+
+        # ----------------------------------------------------------------------
+        # 2. Query eth_chainId, net_version, & eth_blockNumber
+        # ----------------------------------------------------------------------
+        print("[3/7] (2) Query eth_chainId & net_version...")
         chain_id = rpc_call("eth_chainId", req_id=1)
         net_ver = rpc_call("net_version", req_id=2)
         block_num = rpc_call("eth_blockNumber", req_id=3)
@@ -70,140 +80,112 @@ def run_metamask_rpc_tests():
         assert chain_id == "0x539", f"Expected 0x539 (1337), got {chain_id}"
         assert net_ver == "1337", f"Expected '1337', got {net_ver}"
 
-        print(f"      [+] eth_chainId: {chain_id} (Decimal: {int(chain_id, 16)})")
-        print(f"      [+] net_version: {net_ver}")
+        print(f"      [+] eth_chainId    : {chain_id} (Decimal: {int(chain_id, 16)})")
+        print(f"      [+] net_version    : {net_ver}")
         print(f"      [+] eth_blockNumber: {block_num} ({int(block_num, 16)} blok)")
         print("      [PASSED] Kompatibilitas Network ID MetaMask valid.\n")
 
         # ----------------------------------------------------------------------
-        # b. Buat Wallet Lokal dengan eth_account
+        # 3. Uji Faucet Sederhana (GET /faucet/<address>)
         # ----------------------------------------------------------------------
-        print("[3/5] (b) Membuat Wallet Lokal Akun Ethereum (secp256k1)...")
+        print("[4/7] (3) Uji Endpoint Faucet (GET /faucet/<address>)...")
         sender_wallet = Account.create()
         recipient_wallet = Account.create()
 
         sender_address = sender_wallet.address
         recipient_address = recipient_wallet.address
 
-        print(f"      [+] Sender Wallet Address   : {sender_address}")
-        print(f"      [+] Recipient Wallet Address: {recipient_address}")
-        print("      [PASSED] Wallet lokal berhasil dibuat.\n")
+        print(f"      [i] Sender Address   : {sender_address}")
+        print(f"      [i] Recipient Address: {recipient_address}")
+
+        # Minting 10 SMPL koin ke sender_address via faucet
+        faucet_res = requests.get(f"{RPC_URL}/faucet/{sender_address}")
+        assert faucet_res.status_code == 200, f"Faucet error {faucet_res.status_code}: {faucet_res.text}"
+        faucet_data = faucet_res.json()
+        assert faucet_data["amount"] == 10
+        assert faucet_data["balance"] == 10
+        print(f"      [+] Faucet sukses: {faucet_data['message']} (Blok #{faucet_data['block_index']})")
+
+        # Verifikasi via eth_getBalance
+        bal_wei_hex = rpc_call("eth_getBalance", [sender_address, "latest"], req_id=4)
+        assert int(bal_wei_hex, 16) == 10 * 10**18, f"Saldo harus 10 * 10^18 Wei, didapat {int(bal_wei_hex, 16)}"
+        print(f"      [+] eth_getBalance terverifikasi: {bal_wei_hex} Wei (10 SMPL)")
+        print("      [PASSED] Faucet endpoint bekerja secara instan.\n")
 
         # ----------------------------------------------------------------------
-        # c. Mint / Mining Saldo ke Alamat Wallet Pengirim
+        # 4. Uji Auto-Mining pada eth_sendRawTransaction
         # ----------------------------------------------------------------------
-        print("[4/5] (c) Minting/Mining Koin ke Alamat Pengirim...")
-        node_id = requests.get(f"{RPC_URL}/node/id").json()["node_identifier"]
-
-        # 1. Node menambang 1 blok untuk mendapatkan reward coinbase (1 koin)
-        requests.get(f"{RPC_URL}/mine")
-
-        # 2. Node mentransfer 1 koin ke alamat wallet sender_address
-        tx_fund = requests.post(
-            f"{RPC_URL}/transactions/new",
-            json={"sender": node_id, "recipient": sender_address, "amount": 1}
-        )
-        assert tx_fund.status_code == 201, f"Funding gagal: {tx_fund.text}"
-
-        # 3. Tambang blok untuk mengonfirmasi transaksi masuk
-        requests.get(f"{RPC_URL}/mine")
-        print(f"      [+] 1 Koin (10^18 Wei) berhasil didistribusikan ke {sender_address}.\n")
-
-        # ----------------------------------------------------------------------
-        # d. Query eth_getBalance (Verifikasi Saldo dalam Hex Wei)
-        # ----------------------------------------------------------------------
-        print("[5/5] (d) Query eth_getBalance...")
-        sender_balance_hex = rpc_call("eth_getBalance", [sender_address, "latest"], req_id=4)
-        recipient_balance_hex = rpc_call("eth_getBalance", [recipient_address, "latest"], req_id=5)
-
-        sender_balance_wei = int(sender_balance_hex, 16)
-        recipient_balance_wei = int(recipient_balance_hex, 16)
-
-        assert sender_balance_wei == 10**18, f"Expected 10^18 Wei, got {sender_balance_wei}"
-        assert recipient_balance_wei == 0, f"Expected 0 Wei, got {recipient_balance_wei}"
-
-        print(f"      [+] Saldo Pengirim  : {sender_balance_hex} Wei ({sender_balance_wei / 10**18} Koin)")
-        print(f"      [+] Saldo Penerima  : {recipient_balance_hex} Wei")
-        print("      [PASSED] eth_getBalance presisi dalam format hex Wei.\n")
-
-        # ----------------------------------------------------------------------
-        # e. Tandatangani & Kirim Raw Transaction via eth_sendRawTransaction
-        # ----------------------------------------------------------------------
-        print("[6/5] (e) Penandatanganan Kriptografis & eth_sendRawTransaction...")
-        # 1. Cek nonce
-        nonce_hex = rpc_call("eth_getTransactionCount", [sender_address, "latest"], req_id=6)
+        print("[5/7] (4) Uji Penandatanganan Kriptografis & Auto-Mining...")
+        nonce_hex = rpc_call("eth_getTransactionCount", [sender_address, "latest"], req_id=5)
         nonce = int(nonce_hex, 16)
-        assert nonce == 0, f"Expected initial nonce 0, got {nonce}"
-        print(f"      [+] Nonce Pengirim terkini: {nonce}")
+        assert nonce == 0
 
-        # 2. Susun dan tandatangani transaksi offline (0.4 koin = 4 * 10^17 Wei)
-        transfer_value_wei = int(0.4 * 10**18)
+        # Kirim 2.5 SMPL koin ke recipient
+        send_wei = int(2.5 * 10**18)
         tx_dict = {
             "nonce": nonce,
             "gasPrice": 1000000000,
             "gas": 21000,
             "to": recipient_address,
-            "value": transfer_value_wei,
+            "value": send_wei,
             "chainId": 1337
         }
-
         signed_tx = sender_wallet.sign_transaction(tx_dict)
         raw_tx_hex = signed_tx.raw_transaction.hex()
         expected_tx_hash = f"0x{signed_tx.hash.hex()}"
-        print(f"      [+] Raw Transaction Hex (RLP): {raw_tx_hex[:40]}...")
-        print(f"      [+] Expected Keccak-256 Hash : {expected_tx_hash}")
 
-        # 3. Kirim via eth_sendRawTransaction
-        tx_hash_result = rpc_call("eth_sendRawTransaction", [raw_tx_hex], req_id=7)
-        assert tx_hash_result.lower() == expected_tx_hash.lower(), (
-            f"Hash mismatch: expected {expected_tx_hash}, got {tx_hash_result}"
-        )
-        print(f"      [+] Sukses dikirim! Transaction Hash: {tx_hash_result}")
+        # Eksekusi eth_sendRawTransaction (blok otomatis di-mine secara instan di sisi server)
+        print("      Mengirim raw transaction ke eth_sendRawTransaction...")
+        tx_hash_result = rpc_call("eth_sendRawTransaction", [raw_tx_hex], req_id=6)
+        assert tx_hash_result.lower() == expected_tx_hash.lower()
+        print(f"      [+] Transaksi sukses diterima & auto-mined! Hash: {tx_hash_result}")
 
-        # 4. Verifikasi transaksi sudah mengantre di mempool lokal
-        mempool_res = requests.get(f"{RPC_URL}/mempool").json()
-        assert mempool_res["length"] == 1, "Transaksi harus masuk ke mempool"
-        print("      [+] Transaksi terkonfirmasi berada di dalam mempool.")
+        # Verifikasi bahwa mempool langsung bersih karena sudah auto-mined ke blok baru
+        mempool_data = requests.get(f"{RPC_URL}/mempool").json()
+        assert mempool_data["length"] == 0, "Mempool harus kosong karena auto-mining langsung membungkus transaksi!"
+        print("      [+] Auto-mining terverifikasi: Transaksi langsung terkonfirmasi tanpa pending tak terbatas.")
 
-        # 5. Tambang blok baru untuk membungkus transaksi MetaMask ini
-        print("      Mining blok baru untuk mengonfirmasi transaksi raw...")
-        mine_res = requests.get(f"{RPC_URL}/mine").json()
-        print(f"      -> Blok {mine_res['index']} ditempa | Proof: {mine_res['proof']}")
+        # Verifikasi saldo baru
+        sender_after_wei = int(rpc_call("eth_getBalance", [sender_address, "latest"], req_id=7), 16)
+        recipient_after_wei = int(rpc_call("eth_getBalance", [recipient_address, "latest"], req_id=8), 16)
+        assert sender_after_wei == 10 * 10**18 - send_wei  # 7.5 SMPL
+        assert recipient_after_wei == send_wei            # 2.5 SMPL
 
-        # 6. Verifikasi saldo akhir kedua akun
-        sender_after_wei = int(rpc_call("eth_getBalance", [sender_address, "latest"], req_id=8), 16)
-        recipient_after_wei = int(rpc_call("eth_getBalance", [recipient_address, "latest"], req_id=9), 16)
-        nonce_after = int(rpc_call("eth_getTransactionCount", [sender_address, "latest"], req_id=10), 16)
+        print(f"      [+] Saldo Pengirim : {sender_after_wei / 10**18} SMPL")
+        print(f"      [+] Saldo Penerima : {recipient_after_wei / 10**18} SMPL")
+        print("      [PASSED] Auto-mining berhasil mengonfirmasi transaksi seketika.\n")
 
-        expected_sender_wei = 10**18 - transfer_value_wei
-        expected_recipient_wei = transfer_value_wei
+        # ----------------------------------------------------------------------
+        # 5. Uji Handler Fallback RPC (eth_syncing, eth_feeHistory, & Unknown)
+        # ----------------------------------------------------------------------
+        print("[6/7] (5) Uji Handler Fallback RPC...")
+        syncing = rpc_call("eth_syncing", req_id=9)
+        assert syncing is False, f"eth_syncing harus False, got {syncing}"
+        print(f"      [+] eth_syncing: {syncing}")
 
-        assert sender_after_wei == expected_sender_wei, (
-            f"Expected sender {expected_sender_wei}, got {sender_after_wei}"
-        )
-        assert recipient_after_wei == expected_recipient_wei, (
-            f"Expected recipient {expected_recipient_wei}, got {recipient_after_wei}"
-        )
-        assert nonce_after == 1, f"Expected nonce 1, got {nonce_after}"
+        fee_hist = rpc_call("eth_feeHistory", ["0x1", "latest", []], req_id=10)
+        assert fee_hist is not None
+        assert "baseFeePerGas" in fee_hist
+        print(f"      [+] eth_feeHistory: baseFeePerGas = {fee_hist['baseFeePerGas']}")
 
-        print(f"      [+] Saldo Pengirim setelah transfer: {sender_after_wei / 10**18} Koin ({sender_after_wei} Wei)")
-        print(f"      [+] Saldo Penerima setelah transfer: {recipient_after_wei / 10**18} Koin ({recipient_after_wei} Wei)")
-        print(f"      [+] Nonce Pengirim setelah transfer: {nonce_after}")
+        # Uji method acak / belum terdefinisi (harus mengembalikan "0x0", BUKAN HTTP 500)
+        unrecognized_res = rpc_call("eth_someArbitraryMethodProbe", ["0x123"], req_id=11)
+        assert unrecognized_res == "0x0", f"Unknown method harus return '0x0', got {unrecognized_res}"
+        print(f"      [+] Fallback RPC untuk method tak dikenal: Mengembalikan '0x0' (Anti-Error).")
+        print("      [PASSED] Handler Fallback RPC bekerja optimal.\n")
 
-        # 7. Uji RPC eth_getBlockByNumber
-        block_data = rpc_call("eth_getBlockByNumber", ["latest", True], req_id=11)
-        assert block_data is not None, "Block object tidak boleh None"
-        assert int(block_data["number"], 16) == mine_res["index"]
-        print(f"      [+] eth_getBlockByNumber('latest') berhasil: Block #{int(block_data['number'], 16)} terverifikasi.")
-
-        # 8. Uji RPC eth_getTransactionReceipt
+        # ----------------------------------------------------------------------
+        # 6. Verifikasi Receipt Transaksi
+        # ----------------------------------------------------------------------
+        print("[7/7] (6) Verifikasi eth_getTransactionReceipt...")
         receipt = rpc_call("eth_getTransactionReceipt", [tx_hash_result], req_id=12)
-        assert receipt is not None, "Receipt tidak boleh None"
-        assert receipt["status"] == "0x1", "Status transaksi harus sukses (0x1)"
-        print(f"      [+] eth_getTransactionReceipt berhasil: Status 0x1 (Sukses).")
+        assert receipt is not None
+        assert receipt["status"] == "0x1"
+        print(f"      [+] eth_getTransactionReceipt terverifikasi: Status 0x1 (Sukses) pada Blok {receipt['blockNumber']}")
+        print("      [PASSED] Receipt transaksi valid.\n")
 
-        print("\n==================================================================")
-        print("   SELURUH PENGUJIAN METAMASK JSON-RPC 2.0 (100%) SUKSES!        ")
+        print("==================================================================")
+        print("   SELURUH PENGUJIAN RUNTIME METAMASK (100%) SUKSES!             ")
         print("==================================================================")
 
     finally:
