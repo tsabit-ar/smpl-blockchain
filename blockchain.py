@@ -38,16 +38,64 @@ class Blockchain:
             self.current_transactions = []
             return block
 
+    @staticmethod
+    def calculate_balance_for_chain(address, chain):
+        """
+        Menghitung total koin masuk (recipient) dikurangi koin keluar (sender) dari seluruh blok.
+        Transaksi coinbase (sender: '0') dihitung sebagai penambahan saldo bagi recipient.
+        """
+        balance = 0.0
+        for block in chain:
+            for tx in block.get('transactions', []):
+                sender = tx.get('sender')
+                recipient = tx.get('recipient')
+                amount = float(tx.get('amount', 0))
+
+                if recipient == address:
+                    balance += amount
+                if sender == address:
+                    balance -= amount
+
+        if balance.is_integer():
+            return int(balance)
+        return balance
+
+    def get_balance(self, address):
+        """
+        Mengambil saldo akun dari self.chain dengan thread-safety.
+        """
+        with self.lock:
+            return self.calculate_balance_for_chain(address, self.chain)
+
     def new_transaction(self, sender, recipient, amount):
         """
         Membuat transaksi baru yang akan masuk ke blok berikutnya yang di-mine (FR-2).
         Dilindungi oleh self.lock untuk thread-safety.
+        Mencegah double-spending dan transaksi defisit saldo:
+        - Abaikan validasi saldo jika sender == '0' (reward coinbase).
+        - Hitung total amount yang sudah dikomit oleh sender di self.current_transactions (pending_spent).
+        - Jika get_balance(sender) - pending_spent < amount, tolak dengan ValueError('Saldo tidak mencukupi').
         """
         with self.lock:
+            amt = float(amount)
+            if amt <= 0:
+                raise ValueError("Jumlah transfer harus lebih besar dari 0")
+
+            if sender != "0":
+                current_balance = self.calculate_balance_for_chain(sender, self.chain)
+                pending_spent = sum(
+                    float(tx.get('amount', 0))
+                    for tx in self.current_transactions
+                    if tx.get('sender') == sender
+                )
+                if current_balance - pending_spent < amt:
+                    raise ValueError("Saldo tidak mencukupi")
+
+            formatted_amt = int(amt) if amt.is_integer() else amt
             self.current_transactions.append({
                 'sender': sender,
                 'recipient': recipient,
-                'amount': amount,
+                'amount': formatted_amt,
             })
             return self.chain[-1]['index'] + 1
 
@@ -105,9 +153,14 @@ class Blockchain:
         Menentukan apakah rantai blockchain valid (FR-6):
         - Melewati validasi pada blok index 0 (Genesis block).
         - Memverifikasi previous_hash dan PoW setiap blok mulai dari index 1.
+        - Simulasi state saldo akun mulai dari index 1:
+          Jika ditemukan transaksi reguler di mana pengirim mentransfer dana
+          melampaui saldo kumulatifnya pada titik blok tersebut, valid_chain() return False.
         """
         if not chain:
             return False
+
+        balances = {}
 
         for i in range(1, len(chain)):
             prev_block = chain[i - 1]
@@ -120,6 +173,26 @@ class Blockchain:
             # 2. Periksa validitas Proof of Work blok
             if not self.valid_proof(curr_block):
                 return False
+
+            # 3. Simulasi state saldo akun untuk seluruh transaksi pada blok ini
+            for tx in curr_block.get('transactions', []):
+                sender = tx.get('sender')
+                recipient = tx.get('recipient')
+                amount = float(tx.get('amount', 0))
+
+                if amount <= 0:
+                    return False
+
+                if sender == "0":
+                    # Transaksi coinbase reward: tambah saldo recipient
+                    balances[recipient] = balances.get(recipient, 0.0) + amount
+                else:
+                    # Transaksi reguler: cek apakah saldo kumulatif sender mencukupi
+                    sender_bal = balances.get(sender, 0.0)
+                    if sender_bal < amount:
+                        return False
+                    balances[sender] = sender_bal - amount
+                    balances[recipient] = balances.get(recipient, 0.0) + amount
 
         return True
 
@@ -157,7 +230,7 @@ class Blockchain:
         if new_chain:
             with self.lock:
                 def tx_sig(tx):
-                    return (tx.get('sender'), tx.get('recipient'), tx.get('amount'))
+                    return (tx.get('sender'), tx.get('recipient'), float(tx.get('amount', 0)))
 
                 # a. Seluruh signature transaksi non-reward pada new_chain
                 new_chain_tx_sigs = set()
@@ -212,6 +285,12 @@ node_identifier = str(uuid4()).replace('-', '')
 blockchain = Blockchain()
 
 
+@app.route('/node/id', methods=['GET'])
+def get_node_id():
+    """Mengembalikan identifier unik dari node ini."""
+    return jsonify({'node_identifier': node_identifier}), 200
+
+
 @app.route('/chain', methods=['GET'])
 def full_chain():
     """Mengambil seluruh salinan rantai lokal dengan thread-safety."""
@@ -223,6 +302,13 @@ def full_chain():
         'length': length,
     }
     return jsonify(response), 200
+
+
+@app.route('/balance/<address>', methods=['GET'])
+def get_account_balance(address):
+    """Mengembalikan saldo terkini dari alamat yang diberikan."""
+    balance = blockchain.get_balance(address)
+    return jsonify({'address': address, 'balance': balance}), 200
 
 
 @app.route('/mempool', methods=['GET'])
@@ -249,7 +335,11 @@ def new_transaction():
     if not all(k in values for k in required):
         return jsonify({'message': 'Missing values in transaction payload'}), 400
 
-    index = blockchain.new_transaction(values['sender'], values['recipient'], values['amount'])
+    try:
+        index = blockchain.new_transaction(values['sender'], values['recipient'], values['amount'])
+    except ValueError as e:
+        return jsonify({'message': str(e)}), 400
+
     response = {'message': f'Transaction will be added to Block {index}'}
     return jsonify(response), 201
 
