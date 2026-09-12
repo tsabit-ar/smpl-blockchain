@@ -45,6 +45,13 @@ def run_metamask_rpc_tests():
     print("==================================================================\n")
 
     p = None
+    # Bersihkan berkas persistensi sebelum pengujian
+    if os.path.exists("chain_5000.json"):
+        try:
+            os.remove("chain_5000.json")
+        except OSError:
+            pass
+
     try:
         # Jalankan Node Blockchain di port 5000
         script_path = os.path.abspath("blockchain.py")
@@ -197,6 +204,12 @@ def run_metamask_rpc_tests():
             except subprocess.TimeoutExpired:
                 p.kill()
             print("          Node RPC berhasil dimatikan.")
+
+        if os.path.exists("chain_5000.json"):
+            try:
+                os.remove("chain_5000.json")
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

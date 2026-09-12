@@ -38,7 +38,16 @@ def run_tests():
     p2 = None
     rogue_server = None
 
+    # Bersihkan berkas persistensi sebelum pengujian agar mulai dari state bersih
+    for f in ["chain_5000.json", "chain_5001.json"]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
     try:
+
         # Menjalankan Node 1 (Port 5000) dan Node 2 (Port 5001) via subprocess
         script_path = os.path.abspath("blockchain.py")
         print("[1/7] Menjalankan Node 1 (Port 5000) & Node 2 (Port 5001)...")
@@ -426,6 +435,13 @@ def run_tests():
                 except subprocess.TimeoutExpired:
                     p.kill()
                 print(f"          Proses {name} berhasil dimatikan.")
+
+        for f in ["chain_5000.json", "chain_5001.json"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

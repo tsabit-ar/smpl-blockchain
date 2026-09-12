@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import threading
 from time import time
 from urllib.parse import urlparse
@@ -17,7 +18,9 @@ from web3 import Web3
 class Blockchain:
     WEI_PER_COIN = 10**18
 
-    def __init__(self):
+    def __init__(self, port=5000):
+        self.port = port
+        self.storage_file = f"chain_{port}.json" if port is not None else None
         self.lock = threading.Lock()
 
         with self.lock:
@@ -26,24 +29,57 @@ class Blockchain:
             self.nodes = set()
             self.account_nonces = {}
 
-            # Inisialisasi Genesis Block (FR-1)
-            genesis_block = {
-                'index': 1,
-                'timestamp': time(),
-                'transactions': [],
-                'proof': 100,
-                'previous_hash': '1'
-            }
-            self.chain.append(genesis_block)
+            # Muat rantai dari storage JSON jika ada di disk, atau buat Genesis Block
+            self.load_chain()
+
+    def save_chain(self):
+        """
+        Menulis self.chain ke self.storage_file secara rapi (json.dump dengan indent=2).
+        """
+        if not self.storage_file:
+            return
+        try:
+            with open(self.storage_file, 'w', encoding='utf-8') as f:
+                json.dump(self.chain, f, indent=2, sort_keys=True)
+        except Exception as e:
+            print(f"Error menyimpan berkas {self.storage_file}: {e}")
+
+    def load_chain(self):
+        """
+        Jika self.storage_file ada di disk, baca JSON, validasi format, dan tetapkan ke self.chain.
+        Jika belum ada, buat Genesis Block lalu panggil save_chain().
+        """
+        if self.storage_file and os.path.exists(self.storage_file):
+            try:
+                with open(self.storage_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list) and len(data) > 0:
+                    self.chain = data
+                    return
+            except Exception as e:
+                print(f"Peringatan: Gagal membaca {self.storage_file}, inisialisasi Genesis Block baru: {e}")
+
+        # Inisialisasi Genesis Block (FR-1)
+        genesis_block = {
+            'index': 1,
+            'timestamp': time(),
+            'transactions': [],
+            'proof': 100,
+            'previous_hash': '1'
+        }
+        self.chain = [genesis_block]
+        self.save_chain()
 
     def append_block(self, block):
         """
         Menambahkan blok valid ke dalam chain dan mereset antrean transaksi lokal (mempool).
         Dilindungi oleh self.lock untuk thread-safety.
+        Menyimpan perubahan ke disk secara otomatis.
         """
         with self.lock:
             self.chain.append(block)
             self.current_transactions = []
+            self.save_chain()
             return block
 
     @staticmethod
@@ -317,6 +353,7 @@ class Blockchain:
 
                 self.current_transactions = reconciled_mempool
                 self.chain = new_chain
+                self.save_chain()
 
             return True
 
@@ -332,8 +369,8 @@ CORS(app)
 # ID Unik untuk node ini (sebagai penerima reward mining)
 node_identifier = str(uuid4()).replace('-', '')
 
-# Inisialisasi Blockchain
-blockchain = Blockchain()
+# Inisialisasi Blockchain (in-memory default saat di-import; ditimpa di __main__ dengan port)
+blockchain = Blockchain(port=None)
 
 
 # ------------------------------------------------------------------------------
@@ -805,6 +842,9 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     port = args.port_flag if args.port_flag else args.port
+
+    # Pastikan Blockchain diinisialisasi dengan menyertakan argumen port dari CLI
+    blockchain = Blockchain(port=port)
 
     # debug=False & use_reloader=False agar proses terminate berjalan bersih tanpa port terkunci
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
