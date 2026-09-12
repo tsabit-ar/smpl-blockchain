@@ -5,11 +5,17 @@ from time import time
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from eth_account import Account
+from eth_account.typed_transactions import TypedTransaction
 from flask import Flask, jsonify, request
 import requests
+import rlp
+from web3 import Web3
 
 
 class Blockchain:
+    WEI_PER_COIN = 10**18
+
     def __init__(self):
         self.lock = threading.Lock()
 
@@ -17,6 +23,7 @@ class Blockchain:
             self.chain = []
             self.current_transactions = []
             self.nodes = set()
+            self.account_nonces = {}
 
             # Inisialisasi Genesis Block (FR-1)
             genesis_block = {
@@ -39,21 +46,29 @@ class Blockchain:
             return block
 
     @staticmethod
-    def calculate_balance_for_chain(address, chain):
+    def _normalize_address(addr):
+        """Menormalisasi alamat Ethereum (0x...) menjadi lowercase."""
+        if isinstance(addr, str) and addr.startswith("0x"):
+            return addr.lower()
+        return addr
+
+    @classmethod
+    def calculate_balance_for_chain(cls, address, chain):
         """
         Menghitung total koin masuk (recipient) dikurangi koin keluar (sender) dari seluruh blok.
         Transaksi coinbase (sender: '0') dihitung sebagai penambahan saldo bagi recipient.
         """
         balance = 0.0
+        norm_target = cls._normalize_address(address)
         for block in chain:
             for tx in block.get('transactions', []):
-                sender = tx.get('sender')
-                recipient = tx.get('recipient')
+                sender = cls._normalize_address(tx.get('sender'))
+                recipient = cls._normalize_address(tx.get('recipient'))
                 amount = float(tx.get('amount', 0))
 
-                if recipient == address:
+                if recipient == norm_target:
                     balance += amount
-                if sender == address:
+                if sender == norm_target:
                     balance -= amount
 
         if balance.is_integer():
@@ -67,7 +82,28 @@ class Blockchain:
         with self.lock:
             return self.calculate_balance_for_chain(address, self.chain)
 
-    def new_transaction(self, sender, recipient, amount):
+    def get_nonce(self, address):
+        """
+        Menghitung jumlah transaksi keluar yang sudah terkonfirmasi di rantai
+        ditambah yang masih pending di mempool.
+        """
+        with self.lock:
+            norm_addr = self._normalize_address(address)
+            count = 0
+            for block in self.chain:
+                for tx in block.get('transactions', []):
+                    sender = self._normalize_address(tx.get('sender'))
+                    if sender == norm_addr:
+                        count += 1
+            for tx in self.current_transactions:
+                sender = self._normalize_address(tx.get('sender'))
+                if sender == norm_addr:
+                    count += 1
+
+            self.account_nonces[norm_addr] = count
+            return count
+
+    def new_transaction(self, sender, recipient, amount, tx_hash=None):
         """
         Membuat transaksi baru yang akan masuk ke blok berikutnya yang di-mine (FR-2).
         Dilindungi oleh self.lock untuk thread-safety.
@@ -81,28 +117,32 @@ class Blockchain:
             if amt <= 0:
                 raise ValueError("Jumlah transfer harus lebih besar dari 0")
 
+            norm_sender = self._normalize_address(sender)
             if sender != "0":
-                current_balance = self.calculate_balance_for_chain(sender, self.chain)
+                current_balance = self.calculate_balance_for_chain(norm_sender, self.chain)
                 pending_spent = sum(
                     float(tx.get('amount', 0))
                     for tx in self.current_transactions
-                    if tx.get('sender') == sender
+                    if self._normalize_address(tx.get('sender')) == norm_sender
                 )
                 if current_balance - pending_spent < amt:
                     raise ValueError("Saldo tidak mencukupi")
 
             formatted_amt = int(amt) if amt.is_integer() else amt
-            self.current_transactions.append({
+            tx_data = {
                 'sender': sender,
                 'recipient': recipient,
                 'amount': formatted_amt,
-            })
+            }
+            if tx_hash:
+                tx_data['hash'] = tx_hash
+
+            self.current_transactions.append(tx_data)
             return self.chain[-1]['index'] + 1
 
     @property
     def last_block(self):
-        with self.lock:
-            return self.chain[-1]
+        return self.chain[-1]
 
     @staticmethod
     def hash(block):
@@ -183,16 +223,19 @@ class Blockchain:
                 if amount <= 0:
                     return False
 
+                norm_sender = self._normalize_address(sender)
+                norm_recipient = self._normalize_address(recipient)
+
                 if sender == "0":
                     # Transaksi coinbase reward: tambah saldo recipient
-                    balances[recipient] = balances.get(recipient, 0.0) + amount
+                    balances[norm_recipient] = balances.get(norm_recipient, 0.0) + amount
                 else:
                     # Transaksi reguler: cek apakah saldo kumulatif sender mencukupi
-                    sender_bal = balances.get(sender, 0.0)
+                    sender_bal = balances.get(norm_sender, 0.0)
                     if sender_bal < amount:
                         return False
-                    balances[sender] = sender_bal - amount
-                    balances[recipient] = balances.get(recipient, 0.0) + amount
+                    balances[norm_sender] = sender_bal - amount
+                    balances[norm_recipient] = balances.get(norm_recipient, 0.0) + amount
 
         return True
 
@@ -230,7 +273,11 @@ class Blockchain:
         if new_chain:
             with self.lock:
                 def tx_sig(tx):
-                    return (tx.get('sender'), tx.get('recipient'), float(tx.get('amount', 0)))
+                    return (
+                        self._normalize_address(tx.get('sender')),
+                        self._normalize_address(tx.get('recipient')),
+                        float(tx.get('amount', 0))
+                    )
 
                 # a. Seluruh signature transaksi non-reward pada new_chain
                 new_chain_tx_sigs = set()
@@ -285,6 +332,278 @@ node_identifier = str(uuid4()).replace('-', '')
 blockchain = Blockchain()
 
 
+# ------------------------------------------------------------------------------
+# Helper Parsing Raw Transaction Ethereum
+# ------------------------------------------------------------------------------
+def parse_raw_transaction(raw_bytes):
+    """
+    Melakukan decode pada raw byte transaksi Ethereum (Legacy RLP atau EIP-2718 Typed).
+    Mengembalikan tuple: (to_address, value_in_wei, nonce)
+    """
+    if raw_bytes[0] in (1, 2, 3):
+        typed_tx = TypedTransaction.from_bytes(raw_bytes)
+        tx_dict = typed_tx.as_dict()
+        to_addr = tx_dict.get('to')
+        if hasattr(to_addr, 'hex'):
+            to_addr = '0x' + to_addr.hex()
+        elif isinstance(to_addr, bytes):
+            to_addr = '0x' + to_addr.hex()
+        else:
+            to_addr = str(to_addr) if to_addr else None
+        value = int(tx_dict.get('value', 0))
+        nonce = int(tx_dict.get('nonce', 0))
+        return to_addr, value, nonce
+    else:
+        decoded = rlp.decode(raw_bytes)
+        nonce = int.from_bytes(decoded[0], 'big') if decoded[0] else 0
+        to_addr = ('0x' + decoded[3].hex()) if decoded[3] else None
+        value = int.from_bytes(decoded[4], 'big') if decoded[4] else 0
+        return to_addr, value, nonce
+
+
+# ------------------------------------------------------------------------------
+# Ethereum JSON-RPC 2.0 Bridge Handler (POST /)
+# ------------------------------------------------------------------------------
+@app.route('/', methods=['POST'])
+def json_rpc():
+    """
+    Lapisan JSON-RPC 2.0 Bridge untuk MetaMask:
+    Mendukung eth_chainId, net_version, eth_blockNumber, eth_getBalance,
+    eth_getTransactionCount, eth_estimateGas, eth_gasPrice, eth_sendRawTransaction,
+    eth_getBlockByNumber, eth_getTransactionReceipt, dsb.
+    """
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return jsonify({
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32700, "message": "Parse error"}
+        }), 400
+
+    def handle_request(req):
+        if not isinstance(req, dict):
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"}
+            }
+
+        req_id = req.get('id')
+        method = req.get('method')
+        params = req.get('params', [])
+
+        try:
+            if method == 'eth_chainId':
+                # Chain ID 1337 -> 0x539
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x539"}
+
+            elif method == 'net_version':
+                return {"jsonrpc": "2.0", "id": req_id, "result": "1337"}
+
+            elif method == 'eth_blockNumber':
+                with blockchain.lock:
+                    height = len(blockchain.chain)
+                return {"jsonrpc": "2.0", "id": req_id, "result": hex(height)}
+
+            elif method == 'eth_getBalance':
+                address = params[0] if params else "0x0"
+                balance_coins = blockchain.get_balance(address)
+                balance_wei = int(float(balance_coins) * blockchain.WEI_PER_COIN)
+                return {"jsonrpc": "2.0", "id": req_id, "result": hex(balance_wei)}
+
+            elif method == 'eth_getTransactionCount':
+                address = params[0] if params else "0x0"
+                nonce = blockchain.get_nonce(address)
+                return {"jsonrpc": "2.0", "id": req_id, "result": hex(nonce)}
+
+            elif method == 'eth_estimateGas':
+                # Standar 21000 gas -> 0x5208
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x5208"}
+
+            elif method == 'eth_gasPrice':
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x0"}
+
+            elif method == 'eth_sendRawTransaction':
+                raw_hex = params[0]
+                raw_bytes = bytes.fromhex(raw_hex[2:] if raw_hex.startswith("0x") else raw_hex)
+
+                # 1. Recover public address pengirim secara kriptografis (secp256k1)
+                sender = Account.recover_transaction(raw_bytes)
+
+                # 2. Parse nilai to, value (Wei), dan nonce
+                to_addr, value_wei, nonce = parse_raw_transaction(raw_bytes)
+
+                # 3. Validasi nonce sesuai get_nonce(sender)
+                expected_nonce = blockchain.get_nonce(sender)
+                if nonce != expected_nonce:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "error": {
+                            "code": -32000,
+                            "message": f"Nonce mismatch: expected {expected_nonce}, got {nonce}"
+                        }
+                    }
+
+                # 4. Konversi nilai Wei ke unit koin
+                value_coins = value_wei / blockchain.WEI_PER_COIN
+                tx_hash = f"0x{Web3.keccak(raw_bytes).hex()}"
+
+                # 5. Masukkan ke mempool via new_transaction
+                blockchain.new_transaction(sender, to_addr, value_coins, tx_hash=tx_hash)
+
+                return {"jsonrpc": "2.0", "id": req_id, "result": tx_hash}
+
+            elif method in ('eth_getBlockByNumber', 'eth_getBlockByHash'):
+                tag = params[0] if params else "latest"
+                full_tx = params[1] if len(params) > 1 else False
+
+                with blockchain.lock:
+                    if method == 'eth_getBlockByHash':
+                        hash_target = str(tag).lower()
+                        if hash_target.startswith("0x"):
+                            hash_target = hash_target[2:]
+                        matched = [b for b in blockchain.chain if blockchain.hash(b).lower() == hash_target]
+                        block = matched[0] if matched else None
+                    elif tag in ("latest", "pending"):
+                        block = blockchain.chain[-1] if blockchain.chain else None
+                    else:
+                        try:
+                            num = int(tag, 16) if isinstance(tag, str) and tag.startswith("0x") else int(tag)
+                            matched = [b for b in blockchain.chain if b['index'] == num]
+                            block = matched[0] if matched else None
+                        except Exception:
+                            block = None
+
+                if not block:
+                    return {"jsonrpc": "2.0", "id": req_id, "result": None}
+
+                block_hash = "0x" + blockchain.hash(block)
+                parent_hash = block['previous_hash']
+                if not parent_hash.startswith("0x"):
+                    parent_hash = "0x" + parent_hash.zfill(64)
+
+                tx_list = []
+                for idx, tx in enumerate(block.get('transactions', [])):
+                    th = tx.get('hash') or ("0x" + hashlib.sha256(json.dumps(tx, sort_keys=True).encode()).hexdigest())
+                    if full_tx:
+                        tx_list.append({
+                            "hash": th,
+                            "nonce": hex(0),
+                            "blockHash": block_hash,
+                            "blockNumber": hex(block['index']),
+                            "transactionIndex": hex(idx),
+                            "from": tx.get('sender'),
+                            "to": tx.get('recipient'),
+                            "value": hex(int(float(tx.get('amount', 0)) * blockchain.WEI_PER_COIN)),
+                            "gas": "0x5208",
+                            "gasPrice": "0x0",
+                            "input": "0x"
+                        })
+                    else:
+                        tx_list.append(th)
+
+                block_obj = {
+                    "number": hex(block['index']),
+                    "hash": block_hash,
+                    "parentHash": parent_hash,
+                    "nonce": hex(block['proof']),
+                    "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+                    "logsBloom": "0x" + "0" * 512,
+                    "transactionsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                    "stateRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                    "receiptsRoot": "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421",
+                    "miner": "0x0000000000000000000000000000000000000000",
+                    "difficulty": "0x1",
+                    "totalDifficulty": hex(block['index']),
+                    "extraData": "0x",
+                    "size": hex(1024),
+                    "gasLimit": "0x1fffffffffffff",
+                    "gasUsed": "0x0",
+                    "timestamp": hex(int(block['timestamp'])),
+                    "transactions": tx_list,
+                    "uncles": []
+                }
+                return {"jsonrpc": "2.0", "id": req_id, "result": block_obj}
+
+            elif method == 'eth_getTransactionReceipt':
+                tx_hash = params[0] if params else None
+                # Cari blok yang memuat transaksi ini
+                found_block = None
+                tx_index = 0
+                with blockchain.lock:
+                    for b in blockchain.chain:
+                        for idx, t in enumerate(b.get('transactions', [])):
+                            th = t.get('hash') or ("0x" + hashlib.sha256(json.dumps(t, sort_keys=True).encode()).hexdigest())
+                            if th.lower() == str(tx_hash).lower():
+                                found_block = b
+                                tx_index = idx
+                                break
+                        if found_block:
+                            break
+
+                if not found_block:
+                    return {"jsonrpc": "2.0", "id": req_id, "result": None}
+
+                receipt = {
+                    "transactionHash": tx_hash,
+                    "transactionIndex": hex(tx_index),
+                    "blockHash": "0x" + blockchain.hash(found_block),
+                    "blockNumber": hex(found_block['index']),
+                    "cumulativeGasUsed": "0x5208",
+                    "gasUsed": "0x5208",
+                    "status": "0x1",
+                    "logs": []
+                }
+                return {"jsonrpc": "2.0", "id": req_id, "result": receipt}
+
+            elif method == 'eth_syncing':
+                return {"jsonrpc": "2.0", "id": req_id, "result": False}
+
+            elif method == 'net_listening':
+                return {"jsonrpc": "2.0", "id": req_id, "result": True}
+
+            elif method == 'web3_clientVersion':
+                return {"jsonrpc": "2.0", "id": req_id, "result": "SMPL-Blockchain/v1.0"}
+
+            elif method in ('eth_call', 'eth_getCode'):
+                return {"jsonrpc": "2.0", "id": req_id, "result": "0x"}
+
+            elif method == 'eth_feeHistory':
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "oldestBlock": "0x1",
+                        "baseFeePerGas": ["0x0", "0x0"],
+                        "gasUsedRatio": [0.0],
+                        "reward": [["0x0"]]
+                    }
+                }
+
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32601, "message": f"Method '{method}' not implemented"}
+                }
+
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32000, "message": str(e)}
+            }
+
+    if isinstance(data, list):
+        return jsonify([handle_request(item) for item in data]), 200
+    else:
+        return jsonify(handle_request(data)), 200
+
+
+# ------------------------------------------------------------------------------
+# REST API Endpoints Standar
+# ------------------------------------------------------------------------------
 @app.route('/node/id', methods=['GET'])
 def get_node_id():
     """Mengembalikan identifier unik dari node ini."""

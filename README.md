@@ -1,6 +1,6 @@
-# Minimal 2-Node Native Blockchain (Proof of Work)
+# Minimal 2-Node Native Blockchain (Proof of Work & Ethereum JSON-RPC Bridge)
 
-Implementasi blockchain native terdistribusi (Layer 1) minimal 2-node berbasis Python, Flask, dan Proof of Work (PoW) dengan proteksi *Thread Safety*, *Account-Based State Engine*, serta pencegahan *Double-Spending*.
+Implementasi blockchain native terdistribusi (Layer 1) minimal 2-node berbasis Python, Flask, dan Proof of Work (PoW) dengan proteksi *Thread Safety*, *Account-Based State Engine*, pencegahan *Double-Spending*, serta **Ethereum JSON-RPC 2.0 Bridge** untuk integrasi langsung ke **MetaMask**.
 
 ---
 
@@ -15,13 +15,30 @@ Implementasi blockchain native terdistribusi (Layer 1) minimal 2-node berbasis P
 - **Pencegahan Double-Spending**:
   - Penolakan transaksi jika `get_balance(sender) - pending_spent < amount` dengan HTTP 400 (`"Saldo tidak mencukupi"`).
   - Validasi ketat pada `valid_chain()`: simulasi saldo akun dari blok ke blok. Rantai yang memuat transaksi defisit saldo otomatis ditolak meskipun nilai Proof of Work-nya valid secara matematis.
+- **Ethereum JSON-RPC 2.0 Bridge (MetaMask Compatible)**:
+  - Endpoint `POST /` menangani spesifikasi Ethereum JSON-RPC 2.0.
+  - Mendukung `eth_chainId` (1337 / `0x539`), `net_version` (`1337`), `eth_blockNumber`, `eth_getBalance` (format hex Wei), `eth_getTransactionCount` (nonce), `eth_estimateGas` (`0x5208`), `eth_gasPrice` (`0x0`), `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getTransactionReceipt`, dsb.
+  - Mendukung decoding transaksi kriptografis secp256k1 offline (Legacy RLP & EIP-1559/EIP-2718 Typed Transactions) via `eth-account`.
 - **Proof of Work (PoW) Dinamis**: Algoritma PoW memvariasikan field `proof` pada kandidat blok secara *in-place* hingga hash SHA-256 blok memenuhi target kesulitan (`0000`). Komputasi berat dieksekusi di luar lock.
 - **Coinbase Mining Reward**: Menyisipkan transaksi reward sistem (`sender: "0"`, `recipient: node_identifier`, `amount: 1`) ke dalam setiap blok yang berhasil di-mine.
 - **Mempool Reorganization & Reconciliation**: Saat reorganisasi rantai (*chain reorganization*), transaksi pada mempool lokal disaring: transaksi yang sudah dicatat pada `new_chain` otomatis dibuang, sedangkan transaksi yatim dari rantai lama lokal yang terbuang dipulihkan kembali ke antrean mempool.
 - **Peer Discovery & Peering**: Registrasi node tetangga menggunakan struktur data set unik untuk mencegah duplikasi URL.
 - **Validasi Rantai & Tamper Detection**: Mengimplementasikan *Longest Chain Rule* dan verifikasi integritas rantai. Rantai terkorupsi/termanipulasi akan ditolak secara otomatis.
-- **Deterministic Hashing**: Serialisasi JSON selalu menggunakan `sort_keys=True` untuk memastikan hash blok konsisten di seluruh platform.
 - **Konfigurasi Port Dinamis**: Mendukung port fleksibel via terminal CLI (`python blockchain.py 5000` / `python blockchain.py 5001`).
+
+---
+
+## 🦊 Konfigurasi Jaringan di MetaMask (Add Network Manually)
+
+Untuk menghubungkan MetaMask ke node blockchain lokal ini, buka MetaMask > **Add a network manually**, lalu masukkan parameter berikut:
+
+| Parameter | Nilai |
+| :--- | :--- |
+| **Network Name** | `SMPL Local Blockchain` |
+| **New RPC URL** | `http://127.0.0.1:5000` |
+| **Chain ID** | `1337` (Hex: `0x539`) |
+| **Currency Symbol** | `SMPL` |
+| **Block Explorer URL** | *(Kosongkan)* |
 
 ---
 
@@ -29,10 +46,11 @@ Implementasi blockchain native terdistribusi (Layer 1) minimal 2-node berbasis P
 
 ```text
 smpl-blockchain/
-├── blockchain.py       # Core Blockchain logic & Flask REST API Server
-├── test_network.py     # Automated End-to-End Acceptance Test script (6 skenario)
-├── requirements.txt    # Dependensi esensial (Flask, requests)
-└── README.md           # Dokumentasi teknis & panduan penggunaan
+├── blockchain.py         # Core Blockchain logic, REST API, & Ethereum JSON-RPC 2.0 Bridge
+├── test_network.py       # Automated End-to-End Acceptance Test (6 skenario jaringan terdistribusi)
+├── test_metamask_rpc.py  # Automated Test untuk JSON-RPC Bridge & MetaMask compatibility
+├── requirements.txt      # Dependensi (Flask, requests, eth-account, web3)
+└── README.md             # Dokumentasi teknis & panduan penggunaan
 ```
 
 ---
@@ -53,48 +71,52 @@ Pastikan Python 3.10+ telah terinstal di sistem Anda.
 
 ---
 
-## ⚡ Menjalankan Pengujian Otomatis (Acceptance Test)
+## ⚡ Menjalankan Pengujian Otomatis
 
-Skrip `test_network.py` mengorkestrasikan Node 1 (port 5000) dan Node 2 (port 5001) secara terprogram menggunakan `subprocess.Popen` dengan pembersihan proses otomatis (`terminate`/`kill` pada blok `finally`).
+### 1. Pengujian Integrasi MetaMask JSON-RPC 2.0
+Menguji kompatibilitas JSON-RPC 2.0, verifikasi Chain ID (1337), pembuatan wallet secp256k1, query saldo hex Wei, signing raw transaction offline, dan mining:
+```bash
+python test_metamask_rpc.py
+```
 
-Jalankan:
+### 2. Pengujian Jaringan Terdistribusi & Konsensus (6 Skenario)
+Menguji isolasi, peering, divergensi, konsensus terdistribusi, tamper detection, dan double-spending:
 ```bash
 python test_network.py
 ```
-
-Skrip ini menguji 6 skenario pengujian:
-1. **Uji Isolasi**: Memvalidasi kedua node memiliki 1 Genesis Block identik.
-2. **Uji Peering**: Mendaftarkan node secara mutual dan memverifikasi pencegahan duplikasi.
-3. **Uji Divergensi**: Mengirim transaksi dan menambang 2 blok baru di Node 1 (panjang rantai Node 1 = 3, Node 2 = 1).
-4. **Uji Konsensus**: Menjalankan `/nodes/resolve` pada Node 2 dan memastikan rantai Node 2 otomatis mengadopsi rantai Node 1 (panjang rantai menjadi 3).
-5. **Uji Integritas / Tamper Detection & Mempool Reconciliation**:
-   - Menolak rantai manipulasi/korup dari rogue peer (`valid_chain()` mengembalikan `False` dan `/nodes/resolve` mempertahankan status authoritative).
-   - Memvalidasi pembersihan transaksi identik dari mempool Node 2 setelah sinkronisasi blok baru dari Node 1.
-6. **Uji Saldo & Double-Spending**:
-   - Penolakan transfer dari saldo 0 (HTTP 400).
-   - Transfer valid dengan saldo yang mencukupi (HTTP 201).
-   - Penolakan percobaan double-spending saat saldo terikat di mempool (HTTP 400).
-   - Penolakan rantai rogue peer yang memiliki PoW valid tetapi memuat transaksi dengan saldo defisit saat konsensus.
 
 ---
 
 ## 🌐 Menjalankan Node Secara Manual
 
-Buka dua jendela terminal terpisah:
+Buka terminal:
 
-### Terminal 1 (Node 1 - Port 5000)
+### Node 1 (Port 5000 - RPC Endpoint MetaMask)
 ```bash
 python blockchain.py 5000
 ```
 
-### Terminal 2 (Node 2 - Port 5001)
+### Node 2 (Port 5001 - Peer Node)
 ```bash
 python blockchain.py 5001
 ```
 
 ---
 
-## 📡 Dokumentasi REST API
+## 📡 Dokumentasi Antarmuka API
+
+### A. Ethereum JSON-RPC 2.0 (`POST /`)
+Endpoint tunggal yang memproses format JSON-RPC 2.0 standar:
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "eth_getBalance",
+  "params": ["0x1FD2dd51b50E5763c6A183818dcc9b97199DaDcA", "latest"],
+  "id": 1
+}
+```
+
+### B. REST API Standar
 
 | Method | Endpoint | Deskripsi | Input JSON | Output Sukses |
 | :--- | :--- | :--- | :--- | :--- |
