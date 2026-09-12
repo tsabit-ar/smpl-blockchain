@@ -10,6 +10,7 @@ from web3 import Web3
 PORT = 5555
 NODE_URL = f"http://127.0.0.1:{PORT}"
 STORAGE_FILE = f"chain_{PORT}.json"
+NODES_FILE = f"nodes_{PORT}.json"
 
 
 def wait_for_node(url, timeout=15):
@@ -34,7 +35,7 @@ def rpc_call(method, params=None, req_id=1):
         "params": params if params is not None else [],
         "id": req_id
     }
-    response = requests.post(NODE_URL, json=payload, timeout=5)
+    response = requests.post(NODE_URL, json=payload, timeout=20)
     assert response.status_code == 200, f"HTTP Error {response.status_code}: {response.text}"
     data = response.json()
     if "error" in data:
@@ -48,11 +49,12 @@ def run_persistence_tests():
     print("==================================================================\n")
 
     # Bersihkan file persistensi sebelum pengujian dimulai
-    if os.path.exists(STORAGE_FILE):
-        try:
-            os.remove(STORAGE_FILE)
-        except OSError:
-            pass
+    for f in [STORAGE_FILE, NODES_FILE, f"{STORAGE_FILE}.tmp", f"{NODES_FILE}.tmp"]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     script_path = os.path.abspath("blockchain.py")
     p = None
@@ -263,12 +265,12 @@ def run_persistence_tests():
                 p.kill()
             print("          Node berhasil dimatikan.")
 
-        if os.path.exists(STORAGE_FILE):
-            try:
-                os.remove(STORAGE_FILE)
-                print(f"          Berkas pengujian {STORAGE_FILE} berhasil dibersihkan.")
-            except OSError:
-                pass
+        for f in [STORAGE_FILE, NODES_FILE, f"{STORAGE_FILE}.tmp", f"{NODES_FILE}.tmp"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

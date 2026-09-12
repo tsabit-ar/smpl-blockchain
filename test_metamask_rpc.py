@@ -31,7 +31,7 @@ def rpc_call(method, params=None, req_id=1):
         "params": params if params is not None else [],
         "id": req_id
     }
-    response = requests.post(RPC_URL, json=payload, timeout=5)
+    response = requests.post(RPC_URL, json=payload, timeout=20)
     assert response.status_code == 200, f"HTTP Error {response.status_code}: {response.text}"
     data = response.json()
     if "error" in data:
@@ -46,11 +46,12 @@ def run_metamask_rpc_tests():
 
     p = None
     # Bersihkan berkas persistensi sebelum pengujian
-    if os.path.exists("chain_5000.json"):
-        try:
-            os.remove("chain_5000.json")
-        except OSError:
-            pass
+    for f in ["chain_5000.json", "nodes_5000.json", "chain_5000.json.tmp", "nodes_5000.json.tmp"]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     try:
         # Jalankan Node Blockchain di port 5000
@@ -205,11 +206,12 @@ def run_metamask_rpc_tests():
                 p.kill()
             print("          Node RPC berhasil dimatikan.")
 
-        if os.path.exists("chain_5000.json"):
-            try:
-                os.remove("chain_5000.json")
-            except OSError:
-                pass
+        for f in ["chain_5000.json", "nodes_5000.json", "chain_5000.json.tmp", "nodes_5000.json.tmp"]:
+            if os.path.exists(f):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

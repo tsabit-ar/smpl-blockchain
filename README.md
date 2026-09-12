@@ -19,10 +19,14 @@ Implementasi blockchain native terdistribusi (Layer 1) minimal 2-node berbasis P
   - Endpoint `POST /` menangani spesifikasi Ethereum JSON-RPC 2.0.
   - Mendukung `eth_chainId` (1337 / `0x539`), `net_version` (`1337`), `eth_blockNumber`, `eth_getBalance` (format hex Wei), `eth_getTransactionCount` (nonce), `eth_estimateGas` (`0x5208`), `eth_gasPrice` (`0x0`), `eth_sendRawTransaction`, `eth_getBlockByNumber`, `eth_getTransactionReceipt`, dsb.
   - Mendukung decoding transaksi kriptografis secp256k1 offline (Legacy RLP & EIP-1559/EIP-2718 Typed Transactions) via `eth-account`.
-- **Persistensi Berkas JSON (Disk Persistence)**:
-  - Penyimpanan dinamis per port (`chain_<port>.json`) dengan format terstruktur rapi (`indent=2`).
-  - Sinkronisasi otomatis ke disk setiap kali ada blok baru yang ditambahkan (`append_block`) atau saat terjadi reorganisasi konsensus rantai (`resolve_conflicts`).
-  - Restorasi state penuh saat node di-shutdown dan dihidupkan kembali (tinggi blok, saldo akun, dan nonce terpulihkan 100%).
+- **Persistensi Berkas JSON & Atomic File Writing**:
+  - Penyimpanan dinamis per port (`chain_<port>.json` dan `nodes_<port>.json`) dengan format terstruktur rapi (`indent=2`).
+  - Penulisan berkas 100% atomik anti-korupsi crash: menulis ke `.tmp`, melakukan `flush()`, `os.fsync()`, dan `os.replace()`.
+  - Persistensi peers: daftar node tetangga (`self.nodes`) otomatis tersimpan dan dimuat kembali saat node restart.
+  - Restorasi state penuh saat node di-shutdown dan dihidupkan kembali (tinggi blok, saldo akun, nonce, dan peers terpulihkan 100%).
+- **Mekanisme Real-Time Block Broadcast**:
+  - Setiap blok yang berhasil di-mine (mining manual, RPC auto-mining, atau faucet) otomatis di-broadcast ke seluruh tetangga via background thread ke endpoint `POST /block/receive`.
+  - Endpoint `POST /block/receive` memvalidasi index blok (`len(chain) + 1`), kesesuaian `previous_hash`, validitas PoW, dan integritas saldo sebelum menambahkannya ke rantai lokal serta membersihkan transaksi terkait dari mempool.
 - **Proof of Work (PoW) Dinamis**: Algoritma PoW memvariasikan field `proof` pada kandidat blok secara *in-place* hingga hash SHA-256 blok memenuhi target kesulitan (`0000`). Komputasi berat dieksekusi di luar lock.
 - **Coinbase Mining Reward**: Menyisipkan transaksi reward sistem (`sender: "0"`, `recipient: node_identifier`, `amount: 1`) ke dalam setiap blok yang berhasil di-mine.
 - **Mempool Reorganization & Reconciliation**: Saat reorganisasi rantai (*chain reorganization*), transaksi pada mempool lokal disaring: transaksi yang sudah dicatat pada `new_chain` otomatis dibuang, sedangkan transaksi yatim dari rantai lama lokal yang terbuang dipulihkan kembali ke antrean mempool.
@@ -52,7 +56,7 @@ Untuk menghubungkan MetaMask ke node blockchain lokal ini, buka MetaMask > **Add
 smpl-blockchain/
 ├── blockchain.py         # Core Blockchain logic, REST API, & Ethereum JSON-RPC 2.0 Bridge
 ├── test_persistence.py   # Automated Test untuk JSON Disk Persistence (shutdown & restart)
-├── test_network.py       # Automated End-to-End Acceptance Test (6 skenario jaringan terdistribusi)
+├── test_network.py       # Automated End-to-End Acceptance Test (8 skenario jaringan terdistribusi & broadcast)
 ├── test_metamask_rpc.py  # Automated Test untuk JSON-RPC Bridge & MetaMask compatibility
 ├── requirements.txt      # Dependensi (Flask, flask-cors, requests, eth-account, web3)
 └── README.md             # Dokumentasi teknis & panduan penggunaan
@@ -79,7 +83,7 @@ Pastikan Python 3.10+ telah terinstal di sistem Anda.
 ## ⚡ Menjalankan Pengujian Otomatis
 
 ### 1. Pengujian JSON Disk Persistence (Shutdown & Restart Node)
-Menguji inisialisasi file storage, transaksi antar-akun, shutdown node (SIGTERM), restart node pada port yang sama, verifikasi keutuhan rantai, saldo, dan nonce 100%, serta kelanjutan operasi pasca-reboot:
+Menguji inisialisasi file storage atomik, transaksi antar-akun, shutdown node (SIGTERM), restart node pada port yang sama, verifikasi keutuhan rantai, saldo, dan nonce 100%, serta kelanjutan operasi pasca-reboot:
 ```bash
 python test_persistence.py
 ```
@@ -90,8 +94,8 @@ Menguji kompatibilitas JSON-RPC 2.0, verifikasi Chain ID (1337), pembuatan walle
 python test_metamask_rpc.py
 ```
 
-### 3. Pengujian Jaringan Terdistribusi & Konsensus (6 Skenario)
-Menguji isolasi, peering, divergensi, konsensus terdistribusi, tamper detection, dan double-spending:
+### 3. Pengujian Jaringan Terdistribusi & Konsensus (8 Skenario)
+Menguji isolasi, peering, divergensi, konsensus terdistribusi, tamper detection, double-spending, persistensi peers, dan **Real-Time Block Broadcast**:
 ```bash
 python test_network.py
 ```
@@ -137,5 +141,7 @@ Endpoint tunggal yang memproses format JSON-RPC 2.0 standar:
 | `GET` | `/node/id` | Mengambil identifier unik node | *None* | `{ "node_identifier": "..." }` (200) |
 | `POST` | `/transactions/new` | Menambahkan transaksi baru ke mempool | `{"sender": "Alice", "recipient": "Bob", "amount": 1}` | `{ "message": "Transaction will be added to Block X" }` (201) / Gagal: `{ "message": "Saldo tidak mencukupi" }` (400) |
 | `GET` | `/mine` | Menjalankan PoW dan menambang blok baru | *None* | Metadata blok baru (200) |
+| `POST` | `/block/receive` | Menerima payload blok baru via Real-Time Broadcast | Object Blok | `{ "message": "Block received and appended", "index": n, "hash": "..." }` (201) |
 | `POST` | `/nodes/register` | Mendaftarkan URL node tetangga | `{"nodes": ["http://127.0.0.1:5001"]}` | `{ "message": "New nodes have been added", "total_nodes": [...] }` (201) |
+| `POST` | `/nodes/unregister` | Menghapus URL node tetangga dari peers | `{"nodes": ["http://127.0.0.1:5001"]}` | `{ "message": "Nodes have been removed", "total_nodes": [...] }` (200) |
 | `GET` | `/nodes/resolve` | Memicu konsensus *Longest Chain Rule* | *None* | Status konsensus & rantai aktif (200) |

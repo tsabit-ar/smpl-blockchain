@@ -39,7 +39,13 @@ def run_tests():
     rogue_server = None
 
     # Bersihkan berkas persistensi sebelum pengujian agar mulai dari state bersih
-    for f in ["chain_5000.json", "chain_5001.json"]:
+    cleanup_files = [
+        "chain_5000.json", "chain_5001.json",
+        "nodes_5000.json", "nodes_5001.json",
+        "chain_5000.json.tmp", "chain_5001.json.tmp",
+        "nodes_5000.json.tmp", "nodes_5001.json.tmp"
+    ]
+    for f in cleanup_files:
         if os.path.exists(f):
             try:
                 os.remove(f)
@@ -50,7 +56,7 @@ def run_tests():
 
         # Menjalankan Node 1 (Port 5000) dan Node 2 (Port 5001) via subprocess
         script_path = os.path.abspath("blockchain.py")
-        print("[1/7] Menjalankan Node 1 (Port 5000) & Node 2 (Port 5001)...")
+        print("[1/8] Menjalankan Node 1 (Port 5000) & Node 2 (Port 5001)...")
         p1 = subprocess.Popen(
             [sys.executable, script_path, "5000"],
             stdout=subprocess.DEVNULL,
@@ -77,7 +83,7 @@ def run_tests():
         # ----------------------------------------------------------------------
         # Skenario 1: Uji Isolasi
         # ----------------------------------------------------------------------
-        print("[2/7] Menjalankan Skenario 1: UJI ISOLASI")
+        print("[2/8] Menjalankan Skenario 1: UJI ISOLASI")
         r1 = requests.get(f"{NODE1_URL}/chain")
         r2 = requests.get(f"{NODE2_URL}/chain")
         assert r1.status_code == 200, f"Node 1 /chain return code {r1.status_code}"
@@ -99,9 +105,9 @@ def run_tests():
         print("      [PASSED] Skenario 1: Uji Isolasi berhasil.\n")
 
         # ----------------------------------------------------------------------
-        # Skenario 2: Uji Peering
+        # Skenario 2: Uji Peering & Persistensi Peers
         # ----------------------------------------------------------------------
-        print("[3/7] Menjalankan Skenario 2: UJI PEERING")
+        print("[3/8] Menjalankan Skenario 2: UJI PEERING & PERSISTENSI PEERS")
         # Daftarkan Node 2 ke Node 1
         reg1 = requests.post(f"{NODE1_URL}/nodes/register", json={"nodes": [NODE2_URL]})
         assert reg1.status_code == 201, f"Gagal registrasi peer di Node 1: {reg1.text}"
@@ -116,14 +122,27 @@ def run_tests():
         reg1_dup = requests.post(f"{NODE1_URL}/nodes/register", json={"nodes": [NODE2_URL]})
         assert len(reg1_dup.json()["total_nodes"]) == 1, "Struktur data set harus mencegah duplikasi"
 
+        # Verifikasi berkas persistensi nodes_{port}.json terbentuk di disk
+        assert os.path.exists("nodes_5000.json"), "Berkas nodes_5000.json harus ada di disk"
+        assert os.path.exists("nodes_5001.json"), "Berkas nodes_5001.json harus ada di disk"
+        with open("nodes_5000.json", "r", encoding="utf-8") as f_n:
+            saved_nodes1 = json.load(f_n)
+        assert NODE2_URL in saved_nodes1, "Node 2 harus tersimpan di nodes_5000.json"
+        print("      [+] Persistensi peer ke file nodes_{port}.json terverifikasi.")
+
         print(f"      [+] Node 1 peers: {reg1.json()['total_nodes']}")
         print(f"      [+] Node 2 peers: {reg2.json()['total_nodes']}")
-        print("      [PASSED] Skenario 2: Uji Peering berhasil tanpa duplikasi.\n")
+
+        # Untuk menguji divergensi pada Skenario 3 (simulasi partisi jaringan),
+        # unregister Node 2 dari Node 1 sementara waktu agar tidak broadcast otomatis
+        requests.post(f"{NODE1_URL}/nodes/unregister", json={"nodes": [NODE2_URL]})
+
+        print("      [PASSED] Skenario 2: Uji Peering & Persistensi Peers berhasil tanpa duplikasi.\n")
 
         # ----------------------------------------------------------------------
         # Skenario 3: Uji Divergensi
         # ----------------------------------------------------------------------
-        print("[4/7] Menjalankan Skenario 3: UJI DIVERGENSI")
+        print("[4/8] Menjalankan Skenario 3: UJI DIVERGENSI")
         # Mine Blok 2 di Node 1 untuk memperoleh saldo reward pertama (1 koin ke node1_id)
         print("      Mining Blok 2 di Node 1 (Coinbase Reward)...")
         m1 = requests.get(f"{NODE1_URL}/mine")
@@ -160,7 +179,7 @@ def run_tests():
         # ----------------------------------------------------------------------
         # Skenario 4: Uji Konsensus (Longest Chain Rule)
         # ----------------------------------------------------------------------
-        print("[5/7] Menjalankan Skenario 4: UJI KONSENSUS (LONGEST CHAIN RULE)")
+        print("[5/8] Menjalankan Skenario 4: UJI KONSENSUS (LONGEST CHAIN RULE)")
         resolve_res = requests.get(f"{NODE2_URL}/nodes/resolve")
         assert resolve_res.status_code == 200, f"Gagal resolve konsensus: {resolve_res.text}"
         resolve_data = resolve_res.json()
@@ -184,7 +203,7 @@ def run_tests():
         # ----------------------------------------------------------------------
         # Skenario 5: Uji Integritas / Tamper Detection & Mempool Reconciliation
         # ----------------------------------------------------------------------
-        print("[6/7] Menjalankan Skenario 5: UJI INTEGRITAS / TAMPER DETECTION")
+        print("[6/8] Menjalankan Skenario 5: UJI INTEGRITAS / TAMPER DETECTION")
         print("      --- Bagian A: Uji Penolakan Rantai Korup ---")
 
         # a. Ambil salinan rantai dari Node 1 dan buat payload tiruan yang lebih panjang & dimanipulasi
@@ -284,7 +303,7 @@ def run_tests():
         # ----------------------------------------------------------------------
         # Skenario 6: Uji Saldo & Double-Spending
         # ----------------------------------------------------------------------
-        print("[7/7] Menjalankan Skenario 6: UJI SALDO & DOUBLE-SPENDING")
+        print("[7/8] Menjalankan Skenario 6: UJI SALDO & DOUBLE-SPENDING")
 
         # a. Uji Penolakan Saldo Nol:
         # Dave telah menghabiskan 1 koinnya ke Eve di Blok 4. Saldo Dave kini 0.
@@ -412,6 +431,69 @@ def run_tests():
         rogue_server.server_close()
         rogue_server = None
 
+        # ----------------------------------------------------------------------
+        # Skenario 7: Uji Real-Time Block Broadcast
+        # ----------------------------------------------------------------------
+        print("[8/8] Menjalankan Skenario 7: UJI REAL-TIME BLOCK BROADCAST")
+        # a. Node 1 dan Node 2 saling peering
+        print("      (a) Menghubungkan peering dua arah antara Node 1 dan Node 2...")
+        reg_b1 = requests.post(f"{NODE1_URL}/nodes/register", json={"nodes": [NODE2_URL]})
+        assert reg_b1.status_code == 201
+        reg_b2 = requests.post(f"{NODE2_URL}/nodes/register", json={"nodes": [NODE1_URL]})
+        assert reg_b2.status_code == 201
+        print("      [+] Peering dua arah aktif: Node 1 <---> Node 2.")
+
+        # Ambil panjang rantai awal sebelum mining di Node 1
+        c1_before = requests.get(f"{NODE1_URL}/chain").json()
+        c2_before = requests.get(f"{NODE2_URL}/chain").json()
+        assert c1_before["length"] == c2_before["length"], "Panjang rantai harus sinkron sebelum broadcast"
+        initial_len = c1_before["length"]
+
+        # b. Kirim transaksi dan tambang blok baru di Node 1
+        print("      (b) Mengirim transaksi dan menambang blok baru di Node 1...")
+        tx_broadcast = requests.post(
+            f"{NODE1_URL}/transactions/new",
+            json={"sender": node1_id, "recipient": "Frank", "amount": 0.5}
+        )
+        assert tx_broadcast.status_code == 201, f"Gagal membuat transaksi ke Frank: {tx_broadcast.text}"
+
+        mine_b_res = requests.get(f"{NODE1_URL}/mine")
+        assert mine_b_res.status_code == 200, f"Gagal menambang di Node 1: {mine_b_res.text}"
+        block_mined = mine_b_res.json()
+        expected_len = initial_len + 1
+        print(f"      [+] Blok #{block_mined['index']} berhasil di-mine di Node 1.")
+
+        # c. Tanpa memanggil /nodes/resolve manual pada Node 2,
+        # verifikasi bahwa panjang rantai dan saldo di Node 2 otomatis bertambah secara instan
+        print("      (c) Memverifikasi propagasi real-time ke Node 2 tanpa /nodes/resolve manual...")
+        received_by_node2 = False
+        start_wait = time.time()
+        while time.time() - start_wait < 3.0:
+            c2_curr = requests.get(f"{NODE2_URL}/chain").json()
+            if c2_curr["length"] == expected_len:
+                received_by_node2 = True
+                break
+            time.sleep(0.1)
+
+        assert received_by_node2, (
+            f"Node 2 gagal menerima broadcast blok #{expected_len} secara otomatis!"
+        )
+
+        # Verifikasi integritas blok terakhir Node 2 cocok 100% dengan Node 1
+        c1_final = requests.get(f"{NODE1_URL}/chain").json()
+        c2_final = requests.get(f"{NODE2_URL}/chain").json()
+        assert c1_final["length"] == c2_final["length"] == expected_len
+        assert c1_final["chain"][-1]["previous_hash"] == c2_final["chain"][-1]["previous_hash"]
+        assert c1_final["chain"][-1]["proof"] == c2_final["chain"][-1]["proof"]
+
+        # Verifikasi saldo Frank di Node 2 otomatis bertambah 0.5 koin
+        bal_frank_n2 = requests.get(f"{NODE2_URL}/balance/Frank").json()["balance"]
+        assert bal_frank_n2 == 0.5, f"Saldo Frank di Node 2 harus 0.5, didapat {bal_frank_n2}"
+
+        print(f"      [+] Panjang rantai Node 2 otomatis sinkron: {c2_final['length']} blok.")
+        print(f"      [+] Saldo Frank di Node 2 otomatis tercermin: {bal_frank_n2} koin.")
+        print("      [PASSED] Skenario 7: Uji Real-Time Block Broadcast berhasil 100%.\n")
+
         print("==================================================================")
         print("   SELURUH SKENARIO PENGUJIAN PENERIMAAN (100%) SUKSES!           ")
         print("==================================================================")
@@ -436,7 +518,7 @@ def run_tests():
                     p.kill()
                 print(f"          Proses {name} berhasil dimatikan.")
 
-        for f in ["chain_5000.json", "chain_5001.json"]:
+        for f in cleanup_files:
             if os.path.exists(f):
                 try:
                     os.remove(f)

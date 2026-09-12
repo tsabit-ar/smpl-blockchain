@@ -21,6 +21,7 @@ class Blockchain:
     def __init__(self, port=5000):
         self.port = port
         self.storage_file = f"chain_{port}.json" if port is not None else None
+        self.nodes_file = f"nodes_{port}.json" if port is not None else None
         self.lock = threading.Lock()
 
         with self.lock:
@@ -29,20 +30,33 @@ class Blockchain:
             self.nodes = set()
             self.account_nonces = {}
 
-            # Muat rantai dari storage JSON jika ada di disk, atau buat Genesis Block
+            # Muat rantai dan daftar peers dari storage JSON jika ada di disk, atau buat Genesis Block
             self.load_chain()
+            self.load_nodes()
 
     def save_chain(self):
         """
-        Menulis self.chain ke self.storage_file secara rapi (json.dump dengan indent=2).
+        Menulis self.chain ke self.storage_file secara atomik:
+        1. Tulis data ke file temporer f"{self.storage_file}.tmp".
+        2. Lakukan flush dan os.fsync().
+        3. os.replace(f"{self.storage_file}.tmp", self.storage_file) agar 100% atomik dan anti-korupsi.
         """
         if not self.storage_file:
             return
+        tmp_file = f"{self.storage_file}.tmp"
         try:
-            with open(self.storage_file, 'w', encoding='utf-8') as f:
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 json.dump(self.chain, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.storage_file)
         except Exception as e:
             print(f"Error menyimpan berkas {self.storage_file}: {e}")
+            if os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
 
     def load_chain(self):
         """
@@ -70,17 +84,90 @@ class Blockchain:
         self.chain = [genesis_block]
         self.save_chain()
 
+    def save_nodes(self):
+        """
+        Menyimpan daftar peers (self.nodes) ke self.nodes_file secara atomik:
+        1. Tulis data ke file temporer f"{self.nodes_file}.tmp".
+        2. Flush dan os.fsync().
+        3. os.replace(...) ke self.nodes_file.
+        """
+        if not self.nodes_file:
+            return
+        tmp_file = f"{self.nodes_file}.tmp"
+        try:
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(sorted(list(self.nodes)), f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_file, self.nodes_file)
+        except Exception as e:
+            print(f"Error menyimpan berkas {self.nodes_file}: {e}")
+            if os.path.exists(tmp_file):
+                try:
+                    os.remove(tmp_file)
+                except OSError:
+                    pass
+
+    def load_nodes(self):
+        """
+        Memuat daftar peers dari self.nodes_file jika tersedia di disk.
+        """
+        if self.nodes_file and os.path.exists(self.nodes_file):
+            try:
+                with open(self.nodes_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self.nodes = set(data)
+            except Exception as e:
+                print(f"Peringatan: Gagal membaca {self.nodes_file}: {e}")
+
     def append_block(self, block):
         """
-        Menambahkan blok valid ke dalam chain dan mereset antrean transaksi lokal (mempool).
+        Menambahkan blok valid ke dalam chain dan membersihkan transaksi di mempool lokal
+        yang sudah termuat di blok tersebut.
         Dilindungi oleh self.lock untuk thread-safety.
-        Menyimpan perubahan ke disk secara otomatis.
+        Menyimpan perubahan ke disk secara atomik otomatis.
         """
         with self.lock:
             self.chain.append(block)
-            self.current_transactions = []
+
+            # Bersihkan transaksi di mempool lokal yang sudah termuat di blok tersebut
+            def tx_sig(tx):
+                if tx.get('hash'):
+                    return tx.get('hash')
+                return (
+                    self._normalize_address(tx.get('sender')),
+                    self._normalize_address(tx.get('recipient')),
+                    float(tx.get('amount', 0))
+                )
+
+            block_tx_sigs = {tx_sig(tx) for tx in block.get('transactions', [])}
+            self.current_transactions = [
+                tx for tx in self.current_transactions
+                if tx_sig(tx) not in block_tx_sigs
+            ]
             self.save_chain()
             return block
+
+    def broadcast_block(self, block):
+        """
+        Mengirim payload blok baru ke endpoint /block/receive pada seluruh node tetangga (self.nodes).
+        Dieksekusi dalam daemon thread terpisah agar tidak memblokir penambang.
+        """
+        with self.lock:
+            peers = list(self.nodes)
+
+        if not peers:
+            return
+
+        def _broadcast():
+            for peer in peers:
+                try:
+                    requests.post(f"{peer}/block/receive", json=block, timeout=3)
+                except requests.RequestException:
+                    pass
+
+        threading.Thread(target=_broadcast, daemon=True).start()
 
     @staticmethod
     def _normalize_address(addr):
@@ -213,6 +300,7 @@ class Blockchain:
         """
         Menambahkan node tetangga baru ke daftar node unik (FR-5).
         Dilindungi oleh self.lock untuk thread-safety.
+        Menyimpan daftar peers ke disk secara atomik.
         """
         parsed_url = urlparse(address)
         node_url = None
@@ -223,7 +311,28 @@ class Blockchain:
 
         if node_url:
             with self.lock:
-                self.nodes.add(node_url)
+                if node_url not in self.nodes:
+                    self.nodes.add(node_url)
+                    self.save_nodes()
+
+    def unregister_node(self, address):
+        """
+        Menghapus node tetangga dari daftar peers.
+        Dilindungi oleh self.lock untuk thread-safety.
+        Menyimpan daftar peers ke disk secara atomik.
+        """
+        parsed_url = urlparse(address)
+        node_url = None
+        if parsed_url.netloc:
+            node_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        elif parsed_url.path:
+            node_url = f"http://{parsed_url.path}"
+
+        if node_url:
+            with self.lock:
+                if node_url in self.nodes:
+                    self.nodes.remove(node_url)
+                    self.save_nodes()
 
     def valid_chain(self, chain):
         """
@@ -402,6 +511,7 @@ def mine_block(reward_recipient=node_identifier, reward_amount=1):
 
     blockchain.proof_of_work(candidate_block)
     block = blockchain.append_block(candidate_block)
+    blockchain.broadcast_block(block)
     return block
 
 
@@ -785,6 +895,86 @@ def mine():
         'transactions': block['transactions'],
         'proof': block['proof'],
         'previous_hash': block['previous_hash']
+    }
+    return jsonify(response), 200
+
+
+@app.route('/block/receive', methods=['POST'])
+def receive_block():
+    """
+    Menerima payload blok baru dari peer tetangga via mekanisme Real-Time Broadcast:
+    1. Validasi struktur payload blok.
+    2. Validasi index: harus persis len(self.chain) + 1.
+    3. Validasi previous_hash: harus cocok dengan hash blok terakhir lokal.
+    4. Validasi Proof of Work (PoW).
+    5. Validasi transaksi & saldo akun: tidak boleh ada transaksi defisit saldo.
+    6. Masukkan blok ke self.chain via append_block(block).
+    """
+    block = request.get_json()
+    if not block or not isinstance(block, dict):
+        return jsonify({'message': 'Invalid block payload'}), 400
+
+    required_fields = ['index', 'timestamp', 'transactions', 'proof', 'previous_hash']
+    if not all(k in block for k in required_fields):
+        return jsonify({'message': 'Missing required fields in block payload'}), 400
+
+    with blockchain.lock:
+        last_block = blockchain.chain[-1]
+        expected_index = len(blockchain.chain) + 1
+        current_hash = blockchain.hash(last_block)
+
+        # Validasi index
+        if block.get('index') != expected_index:
+            return jsonify({
+                'message': f"Index mismatch: expected {expected_index}, got {block.get('index')}"
+            }), 400
+
+        # Validasi previous_hash
+        if block.get('previous_hash') != current_hash:
+            return jsonify({
+                'message': f"previous_hash mismatch: expected {current_hash}, got {block.get('previous_hash')}"
+            }), 400
+
+        # Validasi Proof of Work
+        if not blockchain.valid_proof(block):
+            return jsonify({'message': 'Invalid Proof of Work'}), 400
+
+        # Validasi transaksi pada blok masuk
+        simulated_chain = blockchain.chain + [block]
+        if not blockchain.valid_chain(simulated_chain):
+            return jsonify({'message': 'Invalid block transactions: account deficit or invalid state'}), 400
+
+    # Masukkan blok valid ke dalam chain (append_block memutasi chain & mempool di bawah self.lock)
+    blockchain.append_block(block)
+
+    response = {
+        'message': 'Block received and appended',
+        'index': block['index'],
+        'hash': blockchain.hash(block)
+    }
+    return jsonify(response), 201
+
+
+@app.route('/nodes/unregister', methods=['POST'])
+def unregister_nodes():
+    """Menghapus node tetangga dari daftar peers."""
+    values = request.get_json()
+    if not values:
+        return jsonify({'message': 'Missing request body'}), 400
+
+    nodes = values.get('nodes')
+    if not nodes or not isinstance(nodes, list):
+        return jsonify({'message': 'Error: Please supply a valid list of nodes'}), 400
+
+    for node in nodes:
+        blockchain.unregister_node(node)
+
+    with blockchain.lock:
+        total_nodes = list(blockchain.nodes)
+
+    response = {
+        'message': 'Nodes have been removed',
+        'total_nodes': total_nodes
     }
     return jsonify(response), 200
 

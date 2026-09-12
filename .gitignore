@@ -8,3 +8,5 @@ env/
 .idea/
 .vscode/
 chain_*.json
+nodes_*.json
+*.tmp
